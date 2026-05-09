@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN    = os.environ.get("BOT_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL   = "llama-3.3-70b-versatile"   # model gratis terbaik di Groq
+GROQ_MODEL   = "llama-3.3-70b-versatile"
 
 # ══════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -28,7 +28,7 @@ def pct(a, b):
     return ((a - b) / b * 100) if b else 0
 
 # ══════════════════════════════════════════════════════════════════
-#  FETCH DATA SAHAM (Yahoo Finance - Gratis)
+#  FETCH DATA (60 hari untuk indikator akurat)
 # ══════════════════════════════════════════════════════════════════
 
 def get_stock_data(ticker: str) -> dict:
@@ -39,7 +39,7 @@ def get_stock_data(ticker: str) -> dict:
     data = r.json()
     res  = data["chart"]["result"]
     if not res:
-        raise ValueError("Saham tidak ditemukan. Cek kode saham kamu.")
+        raise ValueError("Saham tidak ditemukan.")
     meta  = res[0]["meta"]
     quote = res[0].get("indicators", {}).get("quote", [{}])[0]
 
@@ -116,7 +116,7 @@ def calc_bollinger(closes, period=20, std_dev=2):
     if len(closes) < period: return None, None, None
     mid = sma(closes, period)
     if mid is None: return None, None, None
-    std   = math.sqrt(sum((x - mid) ** 2 for x in closes[-period:]) / period)
+    std = math.sqrt(sum((x - mid) ** 2 for x in closes[-period:]) / period)
     return mid + std_dev * std, mid, mid - std_dev * std
 
 def calc_stochastic(closes, highs, lows, k_period=14):
@@ -139,52 +139,132 @@ def calc_volume_ratio(volumes):
     avg = sum(volumes[-6:-1]) / 5
     return (volumes[-1] / avg) if avg else None
 
-def calc_pivot_fibonacci(high, low, close):
-    pivot = (high + low + close) / 3
+# ══════════════════════════════════════════════════════════════════
+#  SUPPORT & RESISTANCE MULTI-SUMBER
+#  Gabungan: Pivot Classic + Swing High/Low historis + Fibonacci
+# ══════════════════════════════════════════════════════════════════
+
+def calc_sr_levels(d: dict) -> dict:
+    """
+    Hitung S/R dari 3 sumber berbeda:
+    1. Pivot Point classic (harian)
+    2. Swing High/Low dari 30 hari terakhir
+    3. Fibonacci retracement dari swing tertinggi-terendah
+    Kemudian bersihkan level yang terlalu berdekatan.
+    """
+    price  = d["price"]
+    high   = d["high"]
+    low    = d["low"]
+    closes = d["closes"]
+    highs  = d["highs"]
+    lows   = d["lows"]
+
+    # ── 1. Pivot Point Classic ─────────────────────────────────────
+    pivot = (high + low + d["prev"]) / 3
     r     = high - low
+    piv_r1 = 2 * pivot - low
+    piv_r2 = pivot + r
+    piv_r3 = high + 2 * (pivot - low)
+    piv_s1 = 2 * pivot - high
+    piv_s2 = pivot - r
+    piv_s3 = low - 2 * (high - pivot)
+
+    # ── 2. Swing High/Low dari 30 hari ────────────────────────────
+    window = 5   # candle kiri-kanan untuk konfirmasi swing
+    swing_highs = []
+    swing_lows  = []
+    h_data = highs[-30:] if len(highs) >= 30 else highs
+    l_data = lows[-30:]  if len(lows)  >= 30 else lows
+
+    for i in range(window, len(h_data) - window):
+        if all(h_data[i] >= h_data[i-j] for j in range(1, window+1)) and \
+           all(h_data[i] >= h_data[i+j] for j in range(1, window+1)):
+            swing_highs.append(h_data[i])
+        if all(l_data[i] <= l_data[i-j] for j in range(1, window+1)) and \
+           all(l_data[i] <= l_data[i+j] for j in range(1, window+1)):
+            swing_lows.append(l_data[i])
+
+    # ── 3. Fibonacci dari 52W high-low ────────────────────────────
+    h52 = d.get("high52") or max(highs) if highs else price * 1.2
+    l52 = d.get("low52")  or min(lows)  if lows  else price * 0.8
+    fib_rng = h52 - l52
+
+    fib_levels = {
+        "fib_236": h52 - fib_rng * 0.236,
+        "fib_382": h52 - fib_rng * 0.382,
+        "fib_500": h52 - fib_rng * 0.500,
+        "fib_618": h52 - fib_rng * 0.618,
+        "fib_786": h52 - fib_rng * 0.786,
+    }
+
+    # ── Kumpulkan semua level resistance & support ─────────────────
+    raw_resistance = [piv_r1, piv_r2, piv_r3] + swing_highs + \
+                     [v for v in fib_levels.values() if v > price]
+    raw_support    = [piv_s1, piv_s2, piv_s3] + swing_lows + \
+                     [v for v in fib_levels.values() if v < price]
+
+    # ── Bersihkan: ambil yang valid dan tidak terlalu berdekatan ──
+    min_gap = price * 0.005   # min gap 0.5% antar level
+
+    def clean_levels(levels, above_price: bool):
+        # Filter: harus di atas/bawah harga
+        filtered = [l for l in levels if (l > price if above_price else l < price)]
+        if not filtered: return []
+        # Sort
+        filtered = sorted(set([round(l) for l in filtered]),
+                          reverse=(not above_price))
+        # Hapus level terlalu berdekatan (cluster → ambil yang paling sering muncul)
+        cleaned = []
+        for lvl in filtered:
+            if not cleaned or abs(lvl - cleaned[-1]) >= min_gap:
+                cleaned.append(lvl)
+        return cleaned
+
+    resistances = clean_levels(raw_resistance, above_price=True)[:4]
+    supports    = clean_levels(raw_support,    above_price=False)[:4]
+
     return {
-        "pivot"   : pivot,
-        "r1": 2 * pivot - low,
-        "r2": pivot + r,
-        "r3": high + 2 * (pivot - low),
-        "s1": 2 * pivot - high,
-        "s2": pivot - r,
-        "s3": low - 2 * (high - pivot),
-        "fib_236" : high - r * 0.236,
-        "fib_382" : high - r * 0.382,
-        "fib_500" : high - r * 0.500,
-        "fib_618" : high - r * 0.618,
+        "pivot"      : round(pivot),
+        "resistances": resistances,   # list terurut, terdekat ke harga duluan
+        "supports"   : supports,      # list terurut, terdekat ke harga duluan
+        "fib"        : {k: round(v) for k, v in fib_levels.items()},
+        # Untuk kompatibilitas
+        "r1": resistances[0] if len(resistances) > 0 else round(piv_r1),
+        "r2": resistances[1] if len(resistances) > 1 else round(piv_r2),
+        "r3": resistances[2] if len(resistances) > 2 else round(piv_r3),
+        "s1": supports[0]    if len(supports)    > 0 else round(piv_s1),
+        "s2": supports[1]    if len(supports)    > 1 else round(piv_s2),
+        "s3": supports[2]    if len(supports)    > 2 else round(piv_s3),
     }
 
 def detect_candle_pattern(closes, highs, lows):
     if len(closes) < 3: return "Tidak cukup data"
-    # Gunakan close[i-1] sebagai open proxy
     patterns = []
     c1, h1, l1 = closes[-1], highs[-1], lows[-1]
-    o1         = closes[-2]
-    c2         = closes[-2]
-    o2         = closes[-3]
+    o1 = closes[-2]
+    c2 = closes[-2]
+    o2 = closes[-3]
 
     body  = abs(c1 - o1)
-    rng   = h1 - l1 or 0.01
+    rng   = (h1 - l1) or 0.01
     upper = h1 - max(o1, c1)
     lower = min(o1, c1) - l1
 
     if body / rng < 0.1:
-        patterns.append("Doji ⚪ (ketidakpastian)")
+        patterns.append("Doji ⚪")
     if lower > 2 * body and upper < body and c1 > o1:
-        patterns.append("Hammer 🔨 (potensi reversal naik)")
+        patterns.append("Hammer 🔨 (reversal naik)")
     if upper > 2 * body and lower < body:
-        patterns.append("Shooting Star ⭐ (potensi reversal turun)")
+        patterns.append("Shooting Star ⭐ (reversal turun)")
     if c2 < o2 and c1 > o1 and c1 > o2 and o1 < c2:
-        patterns.append("Bullish Engulfing 🟢 (sinyal beli kuat)")
+        patterns.append("Bullish Engulfing 🟢")
     if c2 > o2 and c1 < o1 and c1 < o2 and o1 > c2:
-        patterns.append("Bearish Engulfing 🔴 (sinyal jual kuat)")
+        patterns.append("Bearish Engulfing 🔴")
 
     return ", ".join(patterns) if patterns else "Tidak ada pola khusus"
 
 # ══════════════════════════════════════════════════════════════════
-#  SCORING MULTI-INDIKATOR (8 indikator voting)
+#  SCORING 8 INDIKATOR
 # ══════════════════════════════════════════════════════════════════
 
 def score_indicators(d: dict, ind: dict) -> dict:
@@ -192,89 +272,57 @@ def score_indicators(d: dict, ind: dict) -> dict:
     scores = {}
     notes  = {}
 
-    # 1. RSI
     rsi = ind.get("rsi")
     if rsi is not None:
-        if rsi < 35:
-            scores["RSI"] = +1; notes["RSI"] = f"RSI {rsi:.1f} — Oversold 🟢"
-        elif rsi > 65:
-            scores["RSI"] = -1; notes["RSI"] = f"RSI {rsi:.1f} — Overbought 🔴"
-        else:
-            scores["RSI"] =  0; notes["RSI"] = f"RSI {rsi:.1f} — Netral ⚪"
+        if rsi < 35:   scores["RSI"] = +1; notes["RSI"] = f"RSI {rsi:.1f} — Oversold 🟢"
+        elif rsi > 65: scores["RSI"] = -1; notes["RSI"] = f"RSI {rsi:.1f} — Overbought 🔴"
+        else:          scores["RSI"] =  0; notes["RSI"] = f"RSI {rsi:.1f} — Netral ⚪"
 
-    # 2. MACD
     macd, signal, hist = ind.get("macd", (None, None, None))
     if macd is not None and signal is not None:
-        if macd > signal:
-            scores["MACD"] = +1; notes["MACD"] = f"MACD {macd:.1f} > Signal — Bullish 🟢"
-        else:
-            scores["MACD"] = -1; notes["MACD"] = f"MACD {macd:.1f} < Signal — Bearish 🔴"
+        if macd > signal:  scores["MACD"] = +1; notes["MACD"] = f"MACD bullish crossover 🟢"
+        else:              scores["MACD"] = -1; notes["MACD"] = f"MACD bearish crossover 🔴"
 
-    # 3. Bollinger Bands
     bb_u, bb_m, bb_l = ind.get("bb", (None, None, None))
     if bb_u and bb_l:
-        if price <= bb_l:
-            scores["BB"] = +1; notes["BB"] = f"Harga di Lower Band Rp {fmt(bb_l)} 🟢"
-        elif price >= bb_u:
-            scores["BB"] = -1; notes["BB"] = f"Harga di Upper Band Rp {fmt(bb_u)} 🔴"
-        else:
-            scores["BB"] =  0; notes["BB"] = f"Di dalam BB (Mid Rp {fmt(bb_m)}) ⚪"
+        if price <= bb_l:   scores["BB"] = +1; notes["BB"] = f"Harga di Lower Band Rp {fmt(bb_l)} 🟢"
+        elif price >= bb_u: scores["BB"] = -1; notes["BB"] = f"Harga di Upper Band Rp {fmt(bb_u)} 🔴"
+        else:               scores["BB"] =  0; notes["BB"] = f"Di dalam BB (Mid Rp {fmt(bb_m)}) ⚪"
 
-    # 4. Stochastic
     stoch_k, _ = ind.get("stoch", (None, None))
     if stoch_k is not None:
-        if stoch_k < 20:
-            scores["Stoch"] = +1; notes["Stoch"] = f"Stoch {stoch_k:.1f} — Oversold 🟢"
-        elif stoch_k > 80:
-            scores["Stoch"] = -1; notes["Stoch"] = f"Stoch {stoch_k:.1f} — Overbought 🔴"
-        else:
-            scores["Stoch"] =  0; notes["Stoch"] = f"Stoch {stoch_k:.1f} — Netral ⚪"
+        if stoch_k < 20:   scores["Stoch"] = +1; notes["Stoch"] = f"Stoch {stoch_k:.1f} — Oversold 🟢"
+        elif stoch_k > 80: scores["Stoch"] = -1; notes["Stoch"] = f"Stoch {stoch_k:.1f} — Overbought 🔴"
+        else:              scores["Stoch"] =  0; notes["Stoch"] = f"Stoch {stoch_k:.1f} — Netral ⚪"
 
-    # 5. EMA Trend
     ema9  = ind.get("ema9")
     ema21 = ind.get("ema21")
     if ema9 and ema21:
-        if price > ema9 > ema21:
-            scores["EMA"] = +1; notes["EMA"] = f"Price>EMA9({fmt(ema9)})>EMA21({fmt(ema21)}) Uptrend 🟢"
-        elif price < ema9 < ema21:
-            scores["EMA"] = -1; notes["EMA"] = f"Price<EMA9({fmt(ema9)})<EMA21({fmt(ema21)}) Downtrend 🔴"
-        else:
-            scores["EMA"] =  0; notes["EMA"] = f"EMA9={fmt(ema9)} EMA21={fmt(ema21)} Mixed ⚪"
+        if price > ema9 > ema21:   scores["EMA"] = +1; notes["EMA"] = f"Price>EMA9({fmt(ema9)})>EMA21({fmt(ema21)}) 🟢"
+        elif price < ema9 < ema21: scores["EMA"] = -1; notes["EMA"] = f"Price<EMA9({fmt(ema9)})<EMA21({fmt(ema21)}) 🔴"
+        else:                      scores["EMA"] =  0; notes["EMA"] = f"EMA Mixed ⚪"
 
-    # 6. Volume
     vol_ratio = ind.get("vol_ratio")
     change    = pct(price, d["prev"])
     if vol_ratio is not None:
-        if vol_ratio > 1.5 and change > 0:
-            scores["Volume"] = +1; notes["Volume"] = f"Volume {vol_ratio:.1f}x rata2 + harga naik 🟢"
-        elif vol_ratio > 1.5 and change < 0:
-            scores["Volume"] = -1; notes["Volume"] = f"Volume {vol_ratio:.1f}x rata2 + harga turun 🔴"
-        else:
-            scores["Volume"] =  0; notes["Volume"] = f"Volume normal {vol_ratio:.1f}x rata2 ⚪"
+        if vol_ratio > 1.5 and change > 0:   scores["Volume"] = +1; notes["Volume"] = f"Volume {vol_ratio:.1f}x + naik 🟢"
+        elif vol_ratio > 1.5 and change < 0: scores["Volume"] = -1; notes["Volume"] = f"Volume {vol_ratio:.1f}x + turun 🔴"
+        else:                                scores["Volume"] =  0; notes["Volume"] = f"Volume normal {vol_ratio:.1f}x ⚪"
 
-    # 7. Pivot Point
-    piv = ind.get("piv", {})
-    if piv:
-        if price > piv.get("r1", price):
-            scores["Pivot"] = +1; notes["Pivot"] = f"Harga breakout R1 Rp {fmt(piv['r1'])} 🟢"
-        elif price < piv.get("s1", price):
-            scores["Pivot"] = -1; notes["Pivot"] = f"Harga breakdown S1 Rp {fmt(piv['s1'])} 🔴"
-        elif price > piv.get("pivot", price):
-            scores["Pivot"] = +1; notes["Pivot"] = f"Harga di atas Pivot Rp {fmt(piv['pivot'])} 🟢"
-        else:
-            scores["Pivot"] = -1; notes["Pivot"] = f"Harga di bawah Pivot Rp {fmt(piv['pivot'])} 🔴"
+    sr  = ind.get("sr", {})
+    piv = sr.get("pivot", price)
+    if price > sr.get("r1", price * 1.1):  scores["Pivot"] = +1; notes["Pivot"] = f"Breakout R1 Rp {fmt(sr.get('r1'))} 🟢"
+    elif price < sr.get("s1", price * 0.9):scores["Pivot"] = -1; notes["Pivot"] = f"Breakdown S1 Rp {fmt(sr.get('s1'))} 🔴"
+    elif price > piv:                       scores["Pivot"] = +1; notes["Pivot"] = f"Di atas Pivot Rp {fmt(piv)} 🟢"
+    else:                                   scores["Pivot"] = -1; notes["Pivot"] = f"Di bawah Pivot Rp {fmt(piv)} 🔴"
 
-    # 8. Posisi 52-Week
     h52 = d.get("high52")
     l52 = d.get("low52")
     if h52 and l52 and (h52 - l52) > 0:
         pos = (price - l52) / (h52 - l52) * 100
-        if pos < 30:
-            scores["52W"] = +1; notes["52W"] = f"Di zona bawah 52W ({pos:.0f}%) — Murah 🟢"
-        elif pos > 75:
-            scores["52W"] = -1; notes["52W"] = f"Di zona atas 52W ({pos:.0f}%) — Mahal 🔴"
-        else:
-            scores["52W"] =  0; notes["52W"] = f"Di zona tengah 52W ({pos:.0f}%) ⚪"
+        if pos < 30:    scores["52W"] = +1; notes["52W"] = f"Zona bawah 52W ({pos:.0f}%) — Murah 🟢"
+        elif pos > 75:  scores["52W"] = -1; notes["52W"] = f"Zona atas 52W ({pos:.0f}%) — Mahal 🔴"
+        else:           scores["52W"] =  0; notes["52W"] = f"Zona tengah 52W ({pos:.0f}%) ⚪"
 
     total   = sum(scores.values())
     bullish = sum(1 for v in scores.values() if v > 0)
@@ -290,7 +338,7 @@ def score_indicators(d: dict, ind: dict) -> dict:
     elif sinyal == "JUAL":
         strength = "💪 KUAT" if bearish >= 6 else ("👌 SEDANG" if bearish >= 4 else "⚠️ LEMAH")
     else:
-        strength = "⚠️ LEMAH — Tunggu konfirmasi lebih lanjut"
+        strength = "⏳ Tunggu konfirmasi"
 
     return {
         "sinyal": sinyal, "strength": strength,
@@ -299,73 +347,188 @@ def score_indicators(d: dict, ind: dict) -> dict:
         "bearish": bearish, "total_v": total_v,
     }
 
-def calc_tp_sl(d: dict, ind: dict, sinyal: str) -> dict:
-    price = d["price"]
-    atr   = ind.get("atr") or (d["high"] - d["low"]) or price * 0.03
-    piv   = ind.get("piv", {})
-    bb_u, _, bb_l = ind.get("bb", (None, None, None))
+# ══════════════════════════════════════════════════════════════════
+#  TP/SL BERBASIS LEVEL S/R NYATA
+#  Prinsip:
+#  - TP1 = Resistance terdekat di atas harga
+#  - TP2 = Resistance berikutnya
+#  - TP3 = Resistance paling jauh (atau 52W High)
+#  - SL  = Di bawah Support terdekat (dengan buffer)
+#  - Hanya valid jika Risk/Reward >= 1.5
+# ══════════════════════════════════════════════════════════════════
 
-    if sinyal == "BELI":
-        sl  = max(max(price - 1.5 * atr, piv.get("s1", 0) * 0.99), price * 0.93)
-        tp1 = max(min(price + 1.0 * atr, piv.get("r1", price * 1.03)), price * 1.025)
-        tp2 = max(min(price + 2.0 * atr, piv.get("r2", price * 1.06)), price * 1.05)
-        tp3 = max(min(price + 3.0 * atr, piv.get("r3", price * 1.10)), price * 1.09)
-    elif sinyal == "JUAL":
-        sl  = min(price + 1.5 * atr, price * 1.07)
-        tp1 = min(price - 1.0 * atr, price * 0.975)
-        tp2 = min(price - 2.0 * atr, price * 0.95)
-        tp3 = min(price - 3.0 * atr, price * 0.91)
-    else:
-        sl  = price * 0.95
-        tp1 = price * 1.03
-        tp2 = price * 1.06
-        tp3 = price * 1.10
+def calc_tp_sl_smart(d: dict, sr: dict, scoring: dict, atr: float) -> dict:
+    price    = d["price"]
+    sinyal   = scoring["sinyal"]
+    resistances = sr.get("resistances", [])
+    supports    = sr.get("supports", [])
 
-    return {
-        "entry": round(price),
-        "sl":    round(sl),
-        "tp1":   round(tp1),
-        "tp2":   round(tp2),
-        "tp3":   round(tp3),
+    # ATR fallback
+    if not atr or atr <= 0:
+        atr = price * 0.02
+
+    result = {
+        "sinyal"   : sinyal,
+        "entry"    : round(price),
+        "sl"       : None,
+        "tp1"      : None,
+        "tp2"      : None,
+        "tp3"      : None,
+        "rr1"      : None,   # Risk/Reward ke TP1
+        "rr2"      : None,
+        "rr3"      : None,
+        "valid"    : False,
+        "invalid_reason": "",
     }
 
+    if sinyal == "BELI":
+        # ── SL: tepat di bawah S1 dengan buffer 0.3% ──────────────
+        if supports:
+            sl = supports[0] * 0.997          # sedikit di bawah S1
+        else:
+            sl = price - 1.5 * atr             # fallback ATR
+
+        # Pastikan SL tidak terlalu jauh (max 8%)
+        sl = max(sl, price * 0.92)
+        risk = price - sl
+
+        if risk <= 0:
+            result["invalid_reason"] = "SL tidak valid (di atas harga)"
+            return result
+
+        # ── TP: gunakan level Resistance yang ada ─────────────────
+        # Filter resistance yang memberikan RR >= 1.5
+        valid_tps = [r for r in resistances if (r - price) / risk >= 1.5]
+
+        if not valid_tps:
+            result["invalid_reason"] = (
+                f"⚠️ Tidak ada ruang TP yang cukup.\n"
+                f"Resistance terdekat Rp {fmt(resistances[0]) if resistances else '-'} "
+                f"terlalu dekat dari entry.\n"
+                f"Risk/Reward < 1.5 — *Tidak disarankan masuk sekarang.*"
+            )
+            return result
+
+        # Assign TP1, TP2, TP3
+        tp1 = valid_tps[0]
+        tp2 = valid_tps[1] if len(valid_tps) > 1 else round(tp1 + 1.0 * atr)
+        tp3 = valid_tps[2] if len(valid_tps) > 2 else round(tp1 + 2.0 * atr)
+
+        # Hitung R/R
+        rr1 = (tp1 - price) / risk
+        rr2 = (tp2 - price) / risk
+        rr3 = (tp3 - price) / risk
+
+        result.update({
+            "sl"   : round(sl),
+            "tp1"  : round(tp1),
+            "tp2"  : round(tp2),
+            "tp3"  : round(tp3),
+            "rr1"  : rr1,
+            "rr2"  : rr2,
+            "rr3"  : rr3,
+            "risk" : round(risk),
+            "valid": True,
+        })
+
+    elif sinyal == "JUAL":
+        # ── SL: tepat di atas R1 ──────────────────────────────────
+        if resistances:
+            sl = resistances[0] * 1.003
+        else:
+            sl = price + 1.5 * atr
+
+        sl   = min(sl, price * 1.08)
+        risk = sl - price
+
+        if risk <= 0:
+            result["invalid_reason"] = "SL tidak valid"
+            return result
+
+        valid_tps = [s for s in supports if (price - s) / risk >= 1.5]
+
+        if not valid_tps:
+            result["invalid_reason"] = (
+                f"⚠️ Tidak ada ruang TP yang cukup.\n"
+                f"Support terdekat terlalu dekat dari entry.\n"
+                f"Risk/Reward < 1.5 — *Tidak disarankan masuk sekarang.*"
+            )
+            return result
+
+        tp1 = valid_tps[0]
+        tp2 = valid_tps[1] if len(valid_tps) > 1 else round(tp1 - 1.0 * atr)
+        tp3 = valid_tps[2] if len(valid_tps) > 2 else round(tp1 - 2.0 * atr)
+
+        rr1 = (price - tp1) / risk
+        rr2 = (price - tp2) / risk
+        rr3 = (price - tp3) / risk
+
+        result.update({
+            "sl"   : round(sl),
+            "tp1"  : round(tp1),
+            "tp2"  : round(tp2),
+            "tp3"  : round(tp3),
+            "rr1"  : rr1,
+            "rr2"  : rr2,
+            "rr3"  : rr3,
+            "risk" : round(risk),
+            "valid": True,
+        })
+
+    else:
+        # HOLD — tidak ada TP/SL
+        result["invalid_reason"] = "Sinyal HOLD — Tunggu konfirmasi lebih lanjut sebelum masuk posisi."
+
+    return result
+
 # ══════════════════════════════════════════════════════════════════
-#  GROQ AI (GRATIS)
+#  GROQ AI SUMMARY
 # ══════════════════════════════════════════════════════════════════
 
 def get_ai_summary(d: dict, ind: dict, scoring: dict, tpsl: dict) -> str:
+    sr  = ind.get("sr", {})
     notes_txt = "\n".join([f"- {k}: {v}" for k, v in scoring["notes"].items()])
-    piv = ind.get("piv", {})
 
-    prompt = f"""Kamu adalah analis teknikal saham Indonesia profesional yang berpengalaman.
-Berikan analisis ringkas dan akurat berdasarkan data berikut:
+    tp_info = ""
+    if tpsl["valid"]:
+        tp_info = (
+            f"Entry: Rp {fmt(tpsl['entry'])} | SL: Rp {fmt(tpsl['sl'])} (risk Rp {fmt(tpsl.get('risk'))})\n"
+            f"TP1: Rp {fmt(tpsl['tp1'])} (RR {tpsl['rr1']:.1f}x) | "
+            f"TP2: Rp {fmt(tpsl['tp2'])} (RR {tpsl['rr2']:.1f}x) | "
+            f"TP3: Rp {fmt(tpsl['tp3'])} (RR {tpsl['rr3']:.1f}x)"
+        )
+    else:
+        tp_info = f"Sinyal tidak actionable: {tpsl.get('invalid_reason', '')}"
+
+    prompt = f"""Kamu adalah analis teknikal saham Indonesia profesional.
+Buat ringkasan analisis SINGKAT berdasarkan data ini:
 
 SAHAM: {d['symbol']} ({d['name']})
-Harga : Rp {fmt(d['price'])} | Prev: Rp {fmt(d['prev'])} ({pct(d['price'],d['prev']):+.2f}%)
+Harga : Rp {fmt(d['price'])} ({pct(d['price'],d['prev']):+.2f}%)
 Volume: {fmt_vol(d['volume'])}
-ATR   : Rp {fmt(ind.get('atr'))}
-52W   : High Rp {fmt(d['high52'])} | Low Rp {fmt(d['low52'])}
+52W   : Low {fmt(d['low52'])} | High {fmt(d['high52'])}
 
-HASIL 8 INDIKATOR ({scoring['bullish']} bullish / {scoring['bearish']} bearish):
+HASIL 8 INDIKATOR ({scoring['bullish']} bullish / {scoring['bearish']} bearish dari {scoring['total_v']}):
 {notes_txt}
 
-SINYAL AKHIR: {scoring['sinyal']} ({scoring['strength']})
-Entry: Rp {fmt(tpsl['entry'])} | TP1: {fmt(tpsl['tp1'])} | TP2: {fmt(tpsl['tp2'])} | TP3: {fmt(tpsl['tp3'])} | SL: {fmt(tpsl['sl'])}
+SINYAL: {scoring['sinyal']} — {scoring['strength']}
 
-Pivot: {fmt(piv.get('pivot'))} | R1: {fmt(piv.get('r1'))} | S1: {fmt(piv.get('s1'))}
+{tp_info}
 
-Tulis analisis SINGKAT dalam format persis ini:
+Support terdekat: Rp {fmt(sr.get('s1'))} | Resistance terdekat: Rp {fmt(sr.get('r1'))}
+
+Tulis dalam format PERSIS ini (jangan tambah apapun di luar format):
 
 KESIMPULAN:
-[2-3 kalimat: kondisi pasar dan alasan sinyal, sebutkan indikator paling dominan]
+[2-3 kalimat ringkas tentang kondisi teknikal dan mengapa sinyal ini muncul]
 
 STRATEGI:
-[1-2 kalimat: cara masuk dan kelola posisi]
+[1-2 kalimat cara masuk dan kelola posisi secara konkret]
 
 WASPADAI:
-[1 kalimat: kondisi yang membatalkan sinyal ini]
+[1 kalimat kondisi spesifik yang membatalkan sinyal ini]
 
-Gunakan bahasa Indonesia. Singkat dan padat. Langsung tanpa basa-basi."""
+Bahasa Indonesia, singkat, langsung ke poin."""
 
     resp = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -375,10 +538,10 @@ Gunakan bahasa Indonesia. Singkat dan padat. Langsung tanpa basa-basi."""
         },
         json={
             "model"      : GROQ_MODEL,
-            "max_tokens" : 500,
-            "temperature": 0.3,
+            "max_tokens" : 400,
+            "temperature": 0.2,
             "messages"   : [
-                {"role": "system", "content": "Kamu analis teknikal saham Indonesia profesional. Jawab singkat, padat, dan dalam bahasa Indonesia."},
+                {"role": "system", "content": "Kamu analis teknikal saham Indonesia. Jawab singkat dan langsung ke poin dalam bahasa Indonesia."},
                 {"role": "user",   "content": prompt},
             ],
         },
@@ -388,29 +551,24 @@ Gunakan bahasa Indonesia. Singkat dan padat. Langsung tanpa basa-basi."""
     return resp.json()["choices"][0]["message"]["content"]
 
 # ══════════════════════════════════════════════════════════════════
-#  BUILD PESAN LENGKAP
+#  BUILD PESAN TELEGRAM
 # ══════════════════════════════════════════════════════════════════
 
-def build_full_message(d, ind, scoring, tpsl, candle, ai_txt, modal):
+def build_message(d, ind, scoring, tpsl, candle, ai_txt, modal):
     sinyal = scoring["sinyal"]
     change = pct(d["price"], d["prev"])
-    piv    = ind.get("piv", {})
+    sr     = ind.get("sr", {})
     bb_u, bb_m, bb_l = ind.get("bb", (None, None, None))
     ema9  = ind.get("ema9")
     ema21 = ind.get("ema21")
     ema50 = ind.get("ema50")
+    price = d["price"]
 
     if sinyal == "BELI":   bar = "🟢🟢 *SINYAL: BELI* 🟢🟢"
     elif sinyal == "JUAL": bar = "🔴🔴 *SINYAL: JUAL* 🔴🔴"
     else:                  bar = "🟡🟡 *SINYAL: HOLD* 🟡🟡"
 
-    lot        = int(modal / (d["price"] * 100)) if d["price"] else 0
-    modal_used = lot * 100 * d["price"]
-
-    def pl(tp):
-        return lot * 100 * (tp - d["price"]) - lot * 100 * tp * 0.002
-
-    # Parse AI text
+    # Parse AI
     kesimpulan = strategi = waspadai = ""
     mode = None
     for line in ai_txt.splitlines():
@@ -419,97 +577,135 @@ def build_full_message(d, ind, scoring, tpsl, candle, ai_txt, modal):
         if up.startswith("KESIMPULAN:"): mode = "k"; continue
         elif up.startswith("STRATEGI:"): mode = "s"; continue
         elif up.startswith("WASPADAI:"): mode = "w"; continue
-        if mode == "k" and l: kesimpulan += l + " "
-        elif mode == "s" and l: strategi  += l + " "
-        elif mode == "w" and l: waspadai  += l + " "
+        if   mode == "k" and l: kesimpulan += l + " "
+        elif mode == "s" and l: strategi   += l + " "
+        elif mode == "w" and l: waspadai   += l + " "
 
     lines = [
         f"{'📈' if change >= 0 else '📉'} *{d['symbol']}* — {d['name']}",
-        f"💵 *Rp {fmt(d['price'])}*  ({change:+.2f}%)  Vol: {fmt_vol(d['volume'])}",
+        f"💵 *Rp {fmt(price)}*  ({change:+.2f}%)  Vol: {fmt_vol(d['volume'])}",
         f"O:{fmt(d['open'])}  H:{fmt(d['high'])}  L:{fmt(d['low'])}",
-        f"52W: {fmt(d['low52'])} — {fmt(d['high52'])}",
+        f"52W: Rp {fmt(d['low52'])} — Rp {fmt(d['high52'])}",
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         bar,
         f"Kekuatan : {scoring['strength']}",
-        f"Skor     : {scoring['bullish']}🟢 vs {scoring['bearish']}🔴 dari {scoring['total_v']} indikator",
+        f"Voting   : {scoring['bullish']}🟢 Bullish | {scoring['bearish']}🔴 Bearish | dari {scoring['total_v']} indikator",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
-        f"🎯 *ENTRY     :* Rp {fmt(tpsl['entry'])}",
-        "",
-        "✅ *TAKE PROFIT:*",
-        f"   🥇 TP1 : Rp {fmt(tpsl['tp1'])}  ({pct(tpsl['tp1'], tpsl['entry']):+.1f}%)",
-        f"   🥈 TP2 : Rp {fmt(tpsl['tp2'])}  ({pct(tpsl['tp2'], tpsl['entry']):+.1f}%)",
-        f"   🥉 TP3 : Rp {fmt(tpsl['tp3'])}  ({pct(tpsl['tp3'], tpsl['entry']):+.1f}%)",
-        "",
-        f"🛑 *STOP LOSS  :* Rp {fmt(tpsl['sl'])}  ({pct(tpsl['sl'], tpsl['entry']):+.1f}%)",
+    ]
+
+    # ── TP/SL Section ─────────────────────────────────────────────
+    if tpsl["valid"]:
+        lot        = int(modal / (price * 100)) if price else 0
+        modal_used = lot * 100 * price
+
+        def pl(tp):
+            arah = 1 if sinyal == "BELI" else -1
+            return arah * lot * 100 * abs(tp - price) - lot * 100 * max(tp, price) * 0.002
+
+        def pl_sl():
+            return -(price - tpsl["sl"]) * lot * 100 if sinyal == "BELI" else -(tpsl["sl"] - price) * lot * 100
+
+        lines += [
+            f"🎯 *ENTRY     :* Rp {fmt(tpsl['entry'])}",
+            "",
+            f"✅ *TAKE PROFIT:*",
+            f"   🥇 TP1 : Rp {fmt(tpsl['tp1'])}  ({pct(tpsl['tp1'], price):+.1f}%)  RR {tpsl['rr1']:.1f}x",
+            f"   🥈 TP2 : Rp {fmt(tpsl['tp2'])}  ({pct(tpsl['tp2'], price):+.1f}%)  RR {tpsl['rr2']:.1f}x",
+            f"   🥉 TP3 : Rp {fmt(tpsl['tp3'])}  ({pct(tpsl['tp3'], price):+.1f}%)  RR {tpsl['rr3']:.1f}x",
+            "",
+            f"🛑 *STOP LOSS  :* Rp {fmt(tpsl['sl'])}  ({pct(tpsl['sl'], price):+.1f}%)",
+            f"   Risk per lot: Rp {fmt(tpsl.get('risk', 0) * 100)}",
+            "",
+        ]
+
+        if lot > 0:
+            lines += [
+                f"💰 *SIMULASI MODAL Rp {fmt(modal)}:*",
+                f"   Beli      : *{lot} lot* ({lot*100:,} lbr)",
+                f"   Modal     : Rp {fmt(modal_used)}",
+                f"   Sisa      : Rp {fmt(modal - modal_used)}",
+                "",
+                f"   💵 Profit TP1 : *+Rp {fmt(pl(tpsl['tp1']))}*",
+                f"   💵 Profit TP2 : *+Rp {fmt(pl(tpsl['tp2']))}*",
+                f"   💵 Profit TP3 : *+Rp {fmt(pl(tpsl['tp3']))}*",
+                f"   💸 Rugi SL    : *-Rp {fmt(abs(pl_sl()))}*",
+                "",
+                "   📌 _TP1→jual 50% | TP2→jual 30% | TP3→jual 20%_",
+            ]
+        else:
+            lines += [
+                f"💰 *MODAL Rp {fmt(modal)}:*",
+                f"   ⚠️ Butuh min Rp {fmt(price * 100)} untuk 1 lot",
+            ]
+    else:
+        # Sinyal tidak valid / HOLD
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"⚠️ *STATUS ENTRY:*",
+            f"   {tpsl.get('invalid_reason', 'Tidak ada sinyal actionable saat ini.')}",
+        ]
+
+    # ── S/R Levels ────────────────────────────────────────────────
+    lines += [
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "📊 *SUPPORT & RESISTANCE:*",
-        f"   🔴 R3: {fmt(piv.get('r3'))}",
-        f"   🔴 R2: {fmt(piv.get('r2'))}",
-        f"   🔴 R1: {fmt(piv.get('r1'))}",
-        f"   ⚪ Pivot: {fmt(piv.get('pivot'))}",
-        f"   🟢 S1: {fmt(piv.get('s1'))}",
-        f"   🟢 S2: {fmt(piv.get('s2'))}",
-        f"   🟢 S3: {fmt(piv.get('s3'))}",
-        "",
-        "📐 *FIBONACCI RETRACEMENT:*",
-        f"   23.6% : Rp {fmt(piv.get('fib_236'))}",
-        f"   38.2% : Rp {fmt(piv.get('fib_382'))}",
-        f"   50.0% : Rp {fmt(piv.get('fib_500'))}",
-        f"   61.8% : Rp {fmt(piv.get('fib_618'))}",
+    ]
+    resistances = sr.get("resistances", [])
+    supports    = sr.get("supports",    [])
+    for i, r in enumerate(resistances[:3], 1):
+        gap = pct(r, price)
+        lines.append(f"   🔴 R{i}: Rp {fmt(r)}  ({gap:+.1f}%)")
+    lines.append(f"   ⚪ Pivot: Rp {fmt(sr.get('pivot'))}")
+    for i, s in enumerate(supports[:3], 1):
+        gap = pct(s, price)
+        lines.append(f"   🟢 S{i}: Rp {fmt(s)}  ({gap:+.1f}%)")
+
+    fib = sr.get("fib", {})
+    if fib:
+        lines += [
+            "",
+            "📐 *FIBONACCI (52W):*",
+            f"   23.6%: Rp {fmt(fib.get('fib_236'))}",
+            f"   38.2%: Rp {fmt(fib.get('fib_382'))}",
+            f"   50.0%: Rp {fmt(fib.get('fib_500'))}",
+            f"   61.8%: Rp {fmt(fib.get('fib_618'))}",
+        ]
+
+    # ── 8 Indikator ───────────────────────────────────────────────
+    lines += [
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "📉 *8 INDIKATOR TEKNIKAL:*",
         "",
     ]
-
     for key, note in scoring["notes"].items():
         lines.append(f"  {note}")
 
     lines += [
         "",
-        f"📊 *Bollinger:* Upper {fmt(bb_u)}  Mid {fmt(bb_m)}  Lower {fmt(bb_l)}",
+        f"📊 *Bollinger:* U:{fmt(bb_u)}  M:{fmt(bb_m)}  L:{fmt(bb_l)}",
         f"📈 *EMA:* 9={fmt(ema9)}  21={fmt(ema21)}  50={fmt(ema50)}",
         f"📏 *ATR:* Rp {fmt(ind.get('atr'))}",
         f"🕯️ *Candlestick:* {candle}",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "🤖 *ANALISIS AI (Groq LLaMA):*",
-        "",
     ]
 
-    if kesimpulan: lines.append(f"📌 *Kesimpulan:* {kesimpulan.strip()}")
-    if strategi:   lines.append(f"\n💡 *Strategi:* {strategi.strip()}")
-    if waspadai:   lines.append(f"\n⚠️ *Waspadai:* {waspadai.strip()}")
+    # ── AI Summary ────────────────────────────────────────────────
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "🤖 *ANALISIS AI:*",
+        "",
+    ]
+    if kesimpulan: lines.append(f"📌 {kesimpulan.strip()}")
+    if strategi:   lines.append(f"\n💡 {strategi.strip()}")
+    if waspadai:   lines.append(f"\n⚠️ {waspadai.strip()}")
 
     lines += [
         "",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"💰 *SIMULASI MODAL Rp {fmt(modal)}:*",
-    ]
-
-    if lot > 0:
-        lines += [
-            f"   Beli      : *{lot} lot* ({lot*100:,} lbr)",
-            f"   Modal     : Rp {fmt(modal_used)}",
-            f"   Sisa cash : Rp {fmt(modal - modal_used)}",
-            "",
-            f"   💵 Profit TP1 : *+Rp {fmt(pl(tpsl['tp1']))}*",
-            f"   💵 Profit TP2 : *+Rp {fmt(pl(tpsl['tp2']))}*",
-            f"   💵 Profit TP3 : *+Rp {fmt(pl(tpsl['tp3']))}*",
-            f"   💸 Rugi SL    : *-Rp {fmt(abs(pl(tpsl['sl'])))}*",
-        ]
-    else:
-        lines += [
-            f"   ⚠️ Modal tidak cukup untuk 1 lot",
-            f"   Butuh minimal Rp {fmt(d['price'] * 100)}",
-        ]
-
-    lines += [
-        "",
-        "📌 _TP1 → jual 50% | TP2 → jual 30% | TP3 → jual 20%_",
         "⚠️ _Disclaimer: Bukan saran investasi profesional. DYOR._",
     ]
 
@@ -527,14 +723,18 @@ def run_full_analysis(ticker: str, modal: int) -> str:
     lows    = d["lows"]
     volumes = d["volumes"]
 
+    # Hitung semua indikator
+    atr_val = calc_atr(highs, lows, closes)
+    sr      = calc_sr_levels(d)
+
     ind = {
         "rsi"      : calc_rsi(closes),
         "macd"     : calc_macd(closes),
         "bb"       : calc_bollinger(closes),
         "stoch"    : calc_stochastic(closes, highs, lows),
-        "atr"      : calc_atr(highs, lows, closes),
+        "atr"      : atr_val,
         "vol_ratio": calc_volume_ratio(volumes),
-        "piv"      : calc_pivot_fibonacci(d["high"], d["low"], d["price"]),
+        "sr"       : sr,
         "ema9"     : ema(closes, 9),
         "ema21"    : ema(closes, 21),
         "ema50"    : ema(closes, 50),
@@ -544,10 +744,10 @@ def run_full_analysis(ticker: str, modal: int) -> str:
     except: candle = "Tidak tersedia"
 
     scoring = score_indicators(d, ind)
-    tpsl    = calc_tp_sl(d, ind, scoring["sinyal"])
+    tpsl    = calc_tp_sl_smart(d, sr, scoring, atr_val)
     ai_txt  = get_ai_summary(d, ind, scoring, tpsl)
 
-    return build_full_message(d, ind, scoring, tpsl, candle, ai_txt, modal)
+    return build_message(d, ind, scoring, tpsl, candle, ai_txt, modal)
 
 # ══════════════════════════════════════════════════════════════════
 #  HANDLERS
@@ -555,41 +755,38 @@ def run_full_analysis(ticker: str, modal: int) -> str:
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *BEI TRADING SIGNAL BOT*\n\n"
-        "Analisis *8 indikator* sekaligus:\n"
-        "RSI · MACD · Bollinger · Stochastic\n"
-        "EMA 9/21/50 · Volume · Pivot · Fibonacci\n\n"
+        "🤖 *BEI TRADING SIGNAL BOT v3*\n\n"
+        "TP/SL sekarang berdasarkan *level S/R nyata*\n"
+        "bukan kalkulasi matematika kaku.\n\n"
         "*PERINTAH:*\n"
-        "📊 `/sinyal BBCA` — sinyal lengkap\n"
+        "📊 `/sinyal BBCA` — sinyal + TP/SL\n"
         "📊 `/sinyal BBCA 2000000` — modal kustom\n"
         "💰 `/average BBCA 2 9500 3 9000`\n"
         "✂️ `/cutloss BBCA 1200 2`\n"
         "📋 `/portofolio`\n"
         "❓ `/help`\n\n"
-        "_Atau kirim kode saham langsung: *TLKM*_\n\n"
+        "_Kirim kode saham langsung: *TLKM*_\n\n"
         "⚠️ _Bukan saran investasi profesional._",
         parse_mode="Markdown"
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *PANDUAN BOT*\n\n"
-        "*8 Indikator yang dipakai:*\n"
-        "1. RSI (14) — oversold/overbought\n"
-        "2. MACD — momentum & crossover\n"
-        "3. Bollinger Bands — breakout/volatilitas\n"
-        "4. Stochastic — timing entry presisi\n"
-        "5. EMA 9/21/50 — tren jangka pendek-menengah\n"
-        "6. Volume Ratio — konfirmasi pergerakan\n"
-        "7. Pivot Point — S/R harian\n"
-        "8. Posisi 52W — zona murah/mahal\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 *Cara Pakai TP:*\n"
-        "• TP1 → Jual 50% posisi\n"
-        "• TP2 → Jual 30% posisi\n"
+        "📖 *PANDUAN v3*\n\n"
+        "*Cara kerja TP/SL baru:*\n"
+        "• TP1/TP2/TP3 diambil dari level *Resistance nyata*\n"
+        "  (Pivot + Swing High historis + Fibonacci)\n"
+        "• SL diletakkan tepat *di bawah Support nyata*\n"
+        "• Sinyal hanya actionable jika *Risk/Reward ≥ 1.5x*\n"
+        "• Jika tidak ada ruang yang cukup → bot bilang *JANGAN MASUK*\n\n"
+        "*8 Indikator:*\n"
+        "RSI · MACD · Bollinger · Stochastic\n"
+        "EMA 9/21/50 · Volume · Pivot · Posisi 52W\n\n"
+        "📌 *Cara pakai TP:*\n"
+        "• TP1 → Jual 50%\n"
+        "• TP2 → Jual 30%\n"
         "• TP3 → Jual 20% sisa\n"
-        "• SL  → Jual SEMUA, stop rugi\n\n"
-        "💡 Prioritaskan sinyal *KUAT* (6+ indikator setuju)!",
+        "• SL  → Jual semua, stop rugi",
         parse_mode="Markdown"
     )
 
@@ -604,14 +801,13 @@ async def cmd_sinyal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except: pass
 
     msg = await update.message.reply_text(
-        f"⏳ Menganalisis *{ticker}* dengan 8 indikator...", parse_mode="Markdown"
-    )
+        f"⏳ Menganalisis *{ticker}*...", parse_mode="Markdown")
     try:
         full = run_full_analysis(ticker, modal)
         await msg.edit_text(full, parse_mode="Markdown")
     except Exception as e:
         logger.exception(e)
-        await msg.edit_text(f"❌ Error: {str(e)}\nContoh kode: BBCA TLKM GOTO BBRI ANTM")
+        await msg.edit_text(f"❌ Error: {str(e)}\nContoh: BBCA TLKM GOTO BBRI ANTM")
 
 async def cmd_average(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or len(ctx.args) < 3:
@@ -641,6 +837,7 @@ async def cmd_average(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sign        = "+" if pl_val >= 0 else "-"
         transaksi   = "\n".join([f"  Tx{i+1}: {l} lot @ Rp {fmt(p)}" for i, (l, p) in enumerate(lp)])
 
+        sr = calc_sr_levels(d)
         text = (
             f"📊 *AVERAGE — {ticker}*\n\n"
             f"{transaksi}\n\n"
@@ -653,15 +850,15 @@ async def cmd_average(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📌 Status     : {status}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 *TARGET DARI HARGA AVG:*\n"
-            f"   🥇 TP1: Rp {fmt(avg * 1.05)} (+5%)\n"
-            f"   🥈 TP2: Rp {fmt(avg * 1.10)} (+10%)\n"
-            f"   🥉 TP3: Rp {fmt(avg * 1.15)} (+15%)\n"
-            f"   🛑 SL : Rp {fmt(avg * 0.95)} (-5%)\n"
+            f"   🥇 TP1: Rp {fmt(sr['r1'])} ({pct(sr['r1'], avg):+.1f}%) — R1\n"
+            f"   🥈 TP2: Rp {fmt(sr['r2'])} ({pct(sr['r2'], avg):+.1f}%) — R2\n"
+            f"   🥉 TP3: Rp {fmt(sr['r3'])} ({pct(sr['r3'], avg):+.1f}%) — R3\n"
+            f"   🛑 SL : Rp {fmt(sr['s1'])} ({pct(sr['s1'], avg):+.1f}%) — S1\n"
         )
         if pl_val < 0:
             avg2 = (avg + current) / 2
             text += (
-                f"\n💡 *Simulasi average down 1x di harga skrg:*\n"
+                f"\n💡 *Simulasi average down 1x:*\n"
                 f"   Avg baru ≈ Rp {fmt(avg2)}\n"
                 f"   Perlu naik {abs(pct(avg, avg2)):.1f}% untuk BEP\n"
             )
@@ -687,24 +884,24 @@ async def cmd_cutloss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         d       = get_stock_data(ticker)
         rsi     = calc_rsi(d["closes"])
-        piv     = calc_pivot_fibonacci(d["high"], d["low"], d["price"])
+        sr      = calc_sr_levels(d)
         current = d["price"]
         pl_val  = (current - buy) * lot * 100
         pl_p    = pct(current, buy)
         status  = "🟢 UNTUNG" if current >= buy else "🔴 RUGI"
         sign    = "+" if pl_val >= 0 else "-"
-        s1      = piv.get("s1", current * 0.97)
+        s1      = sr.get("s1", current * 0.97)
 
         if current < s1:
             rek = f"⚠️ Harga di bawah S1 (Rp {fmt(s1)}). *Pertimbangkan cut loss sekarang.*"
         elif current < buy * 0.93:
             rek = f"⚠️ Sudah turun >7%. *Sangat disarankan cut loss segera.*"
         elif rsi and rsi < 35:
-            rek = f"💡 RSI {rsi:.1f} oversold. Bisa tunggu sedikit, tapi pantau S1 Rp {fmt(s1)}."
+            rek = f"💡 RSI {rsi:.1f} oversold — bisa tunggu, tapi monitor S1 Rp {fmt(s1)}."
         elif current < buy * 0.97:
-            rek = f"💡 Turun 3-7%. Pantau ketat. Cut jika tembus Rp {fmt(buy * 0.93)}."
+            rek = f"💡 Turun 3-7%. Pantau ketat. Cut jika tembus S1 Rp {fmt(s1)}."
         else:
-            rek = f"✅ Masih aman. Monitor support S1 di Rp {fmt(s1)}."
+            rek = f"✅ Masih aman. Monitor S1 di Rp {fmt(s1)}."
 
         text = (
             f"✂️ *CUT LOSS — {ticker}*\n\n"
@@ -719,10 +916,10 @@ async def cmd_cutloss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   Ketat  (-5%) : Rp {fmt(buy * 0.95)}\n"
             f"   Normal (-7%) : Rp {fmt(buy * 0.93)}\n"
             f"   Longgar(-10%): Rp {fmt(buy * 0.90)}\n\n"
-            f"📊 *SUPPORT:*\n"
-            f"   S1: Rp {fmt(piv.get('s1'))}\n"
-            f"   S2: Rp {fmt(piv.get('s2'))}\n"
-            f"   S3: Rp {fmt(piv.get('s3'))}\n\n"
+            f"📊 *SUPPORT (dari chart):*\n"
+            f"   S1: Rp {fmt(sr.get('s1'))}  ({pct(sr.get('s1', current), current):+.1f}%)\n"
+            f"   S2: Rp {fmt(sr.get('s2'))}  ({pct(sr.get('s2', current), current):+.1f}%)\n"
+            f"   S3: Rp {fmt(sr.get('s3'))}  ({pct(sr.get('s3', current), current):+.1f}%)\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{rek}\n\n"
             f"⚠️ _Bukan saran investasi profesional._"
@@ -743,13 +940,13 @@ async def cmd_portofolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "   TP2 → Jual 30%\n"
         "   TP3 → Jual 20% sisa\n\n"
         "🛑 *Aturan SL:*\n"
-        "   • Pasang SL sebelum beli\n"
-        "   • Max loss per trade: -5% sd -7%\n"
+        "   • SL selalu di bawah level Support nyata\n"
+        "   • Jangan masuk jika RR < 1.5x\n"
         "   • Jangan average down sembarangan\n\n"
         "📌 *Prioritas Sinyal:*\n"
-        "   KUAT (6+ indikator) → Masuk\n"
-        "   SEDANG (4-5)        → Hati-hati, modal kecil\n"
-        "   LEMAH (<4)          → Skip, tunggu sinyal lebih baik\n\n"
+        "   KUAT (6+ indikator) + RR ≥ 2x → *Masuk*\n"
+        "   SEDANG (4-5) + RR ≥ 1.5x     → *Hati-hati*\n"
+        "   LEMAH (<4) atau RR < 1.5x    → *Skip*\n\n"
         "💪 *Konsistensi > Profit besar sekali!*",
         parse_mode="Markdown"
     )
@@ -771,9 +968,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN tidak ditemukan di environment variable!")
+        raise ValueError("BOT_TOKEN tidak ada!")
     if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY tidak ditemukan di environment variable!")
+        raise ValueError("GROQ_API_KEY tidak ada!")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",      cmd_start))
@@ -784,7 +981,7 @@ def main():
     app.add_handler(CommandHandler("cutloss",    cmd_cutloss))
     app.add_handler(CommandHandler("portofolio", cmd_portofolio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("✅ BEI Signal Bot started dengan Groq AI!")
+    logger.info("✅ BEI Signal Bot v3 started!")
     app.run_polling()
 
 if __name__ == "__main__":
